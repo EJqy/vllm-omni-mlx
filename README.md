@@ -93,19 +93,20 @@ mlx-lm 0.32 and mlx-vlm 0.7.
 
 ```sh
 # omni-modality server: Qwen3-Omni chat + speech synthesis in one process
-vllm-omni-mlx --model mlx-community/Qwen3-Omni-30B-A3B-Instruct-4bit \
+vllm-omni-mlx serve mlx-community/Qwen3-Omni-30B-A3B-Instruct-4bit \
     --tts-model mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit      # needs [omni] + [tts]
 
 # speech-only server
-vllm-omni-mlx --tts-model mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit
+vllm-omni-mlx serve mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit --omni
 ```
 
 Qwen3-Omni serves text-out chat today (speech-out chat is in progress); the 30B-A3B
 4-bit checkpoint is ~22 GB, so pick a Mac with the memory for it.
 
 Options: `--host` (default `127.0.0.1`), `--port` (default `8000`), `--backend auto|text|omni`
-(auto sniffs `config.json` for vision/audio sections), `--api-key` to require `Authorization: Bearer …`
-or `x-api-key`.
+(auto sniffs `config.json` for vision/audio sections), `--omni` (serve the model omni-modally:
+a Qwen3-TTS checkpoint serves `/v1/audio/*`, anything else forces the omni backend),
+`--api-key` to require `Authorization: Bearer …` or `x-api-key`.
 
 Performance flags:
 
@@ -126,7 +127,7 @@ re-prefill, so correctness never depends on the cache).
 | --- | --- |
 | `POST /v1/chat/completions` | OpenAI (streaming via SSE, `stop`, multimodal `image_url` / `input_audio` content parts) |
 | `POST /v1/messages` | Anthropic (streaming via SSE, `stop_sequences`, base64/URL image blocks) |
-| `POST /v1/audio/speech` | OpenAI audio (`wav` 24 kHz mono / raw `pcm`; needs `--tts-model`, `[tts]` extra) |
+| `POST /v1/audio/speech` | OpenAI audio (`wav` 24 kHz mono / raw `pcm`; needs a TTS model via `--omni` or `--tts-model`, `[tts]` extra) |
 | `GET /v1/audio/voices` | preset CustomVoice speakers for the loaded TTS model |
 | `GET /v1/models` | OpenAI model list |
 | `GET /health` | liveness |
@@ -135,7 +136,7 @@ Speech synthesis quickstart:
 
 ```sh
 pip install 'vllm-omni-mlx[tts]'
-vllm-omni-mlx --tts-model mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit --api-key demo
+vllm-omni-mlx serve mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit --omni --api-key demo
 curl -H 'Authorization: Bearer demo' -H 'Content-Type: application/json' \
     -d '{"input": "Hello from vllm omni em el ex.", "voice": "vivian"}' \
     http://127.0.0.1:8000/v1/audio/speech -o speech.wav
