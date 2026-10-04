@@ -15,10 +15,17 @@ from typing import Any, Iterator, Optional
 import mlx.core as mx
 
 from .config import TTSConfig
-from .generate import MAX_REF_SECONDS, decode_ref_audio, synthesize, synthesize_clone, wav_bytes
+from .generate import (
+    MAX_REF_SECONDS,
+    decode_ref_audio,
+    synthesize,
+    synthesize_clone,
+    synthesize_design,
+    wav_bytes,
+)
 from .prompt_embeds import PromptEmbeds
 from .stream_loop import synthesize_clone_stream, synthesize_stream
-from .variants import CUSTOM_VOICE, SMALL_SIZE, model_size, model_variant, require_served
+from .variants import BASE, SMALL_SIZE, VOICE_DESIGN, model_size, model_variant, require_served
 
 # stream-path chunk default (#40's measured knee; the buffered path keeps
 # TTSConfig.streaming_interval — chunking is irrelevant when joining)
@@ -64,9 +71,10 @@ class TTSService:
     ) -> tuple[bytes, str]:
         """Synthesize `input` to (payload, content_type). `voice` is a preset
         speaker name or — on Base checkpoints — a cloning object
-        ``{"ref_audio": <base64>, "ref_text": "..."}`` (#49). Raises
-        ValueError on invalid requests; generation is serialized under the
-        service lock."""
+        ``{"ref_audio": <base64>, "ref_text": "..."}`` (#49). On VoiceDesign
+        checkpoints the voice comes from `instructions` and `voice` is
+        rejected (#51). Raises ValueError on invalid requests; generation is
+        serialized under the service lock."""
         if isinstance(voice, dict):
             ref_audio, ref_text = self._clone_inputs(input, voice, speed)
             with self._lock:
@@ -75,8 +83,9 @@ class TTSService:
                     return wav_bytes(chunks), "audio/wav"
                 return b"".join(_pcm16(chunk) for chunk in chunks), "audio/pcm"
         overrides = self._validated_overrides(input, voice, speed, instructions, language)
+        entry = synthesize_design if self._variant == VOICE_DESIGN else synthesize
         with self._lock:
-            chunks = synthesize(self._model, self.config, input, **overrides)
+            chunks = entry(self._model, self.config, input, **overrides)
             if response_format == "wav":
                 return wav_bytes(chunks), "audio/wav"
             return b"".join(_pcm16(chunk) for chunk in chunks), "audio/pcm"
@@ -126,6 +135,11 @@ class TTSService:
                         yield _pcm16(chunk)
 
             return clone_stream()
+        if self._variant == VOICE_DESIGN:
+            raise ValueError(
+                "streaming VoiceDesign synthesis is not supported yet — #52; "
+                "the buffered path (stream absent/false) serves it"
+            )
         overrides = self._validated_overrides(input, voice, speed, instructions, language)
         interval = DEFAULT_STREAM_INTERVAL if streaming_interval is None else streaming_interval
         if not 0.0 < interval <= 10.0:
@@ -176,25 +190,38 @@ class TTSService:
 
     def _validated_overrides(self, input, voice, speed, instructions, language) -> dict:
         self._require_valid_request(input, speed)
-        if self._variant != CUSTOM_VOICE:
-            # base (no spk_id presets, cloning-only) and voice_design need
-            # generation paths this build doesn't have yet — reject with the
-            # tracking issue rather than a confusing preset-voice error
-            require_served(self._variant)
-        speaker = (voice or self.config.speaker).lower()
-        if speaker not in self.voices:
-            raise ValueError(f"voice '{voice}' is not one of the preset voices")
-        if instructions and self._model_size == SMALL_SIZE:
-            # mlx-audio's own 0.6B instruct guard is dead code; rejecting
-            # here keeps the behavior deterministic instead of hoping the
-            # small model handles a prompt it wasn't trained for
-            raise ValueError(
-                "instructions (emotion/style) need a 1.7B CustomVoice model; "
-                "the 0.6B model was not trained for them"
-            )
-        overrides = {"speaker": speaker}
-        if instructions:
-            overrides["instruct"] = instructions
+        if self._variant == VOICE_DESIGN:
+            # the description IS the voice: no preset speakers exist on this
+            # checkpoint type (#51; mlx-audio maps instructions → instruct)
+            if voice is not None:
+                raise ValueError(
+                    "VoiceDesign checkpoints have no preset voices — the "
+                    "voice comes from `instructions` (a text description)"
+                )
+            if not instructions or not instructions.strip():
+                raise ValueError(
+                    "`instructions` is required on VoiceDesign checkpoints — "
+                    "a voice description like 'A cheerful young female voice "
+                    "with high pitch and energetic tone'"
+                )
+            overrides = {"instruct": instructions.strip()}
+        elif self._variant == BASE:
+            require_served(self._variant)  # → guidance to the cloning shape
+        else:
+            speaker = (voice or self.config.speaker).lower()
+            if speaker not in self.voices:
+                raise ValueError(f"voice '{voice}' is not one of the preset voices")
+            if instructions and self._model_size == SMALL_SIZE:
+                # mlx-audio's own 0.6B instruct guard is dead code; rejecting
+                # here keeps the behavior deterministic instead of hoping the
+                # small model handles a prompt it wasn't trained for
+                raise ValueError(
+                    "instructions (emotion/style) need a 1.7B CustomVoice model; "
+                    "the 0.6B model was not trained for them"
+                )
+            overrides = {"speaker": speaker}
+            if instructions:
+                overrides["instruct"] = instructions
         if language:
             overrides["language"] = language
         return overrides

@@ -8,7 +8,9 @@ The family ships three types (HF ``config.json`` → ``tts_model_type``):
   encoder solely for base checkpoints — qwen3_tts.py:180; its README table
   "Fast, predefined voices" for Base is stale, see #45's correction).
 - ``custom_voice`` — ``spk_id`` presets + emotion ``instruct``.
-- ``voice_design`` — any voice from a text description (#46).
+- ``voice_design`` — any voice from a text description (#46): the
+  description rides ``instruct`` (mlx-audio's own ``generate()`` maps it
+  that way), the speaker row is simply absent from the prompt.
 
 Served-ness is a path × type question, not a type question (#49):
 
@@ -19,6 +21,8 @@ preset (buffered)  custom_voice    :func:`generate.synthesize`
 preset (streaming) custom_voice    :func:`stream_loop.synthesize_stream`
 clone (buffered)   base            :func:`generate.synthesize_clone`
 clone (streaming)  base            :func:`stream_loop.synthesize_clone_stream`
+design (buffered)  voice_design    :func:`generate.synthesize_design`
+design (streaming) — none yet      #52
 =================  ==============  =====================================
 """
 
@@ -44,6 +48,7 @@ SERVED_BY_PATH = {
     "preset": (CUSTOM_VOICE,),
     "clone": (BASE,),  # buffered
     "clone_stream": (BASE,),  # streaming (#50)
+    "design": (VOICE_DESIGN,),  # buffered (#51); streaming design is #52
 }
 
 #: kept from #47 for the preset paths — ``SERVED_BY_PATH["preset"]``
@@ -62,9 +67,19 @@ _TRACKING = {
         "voice cloning needs a Base checkpoint; CustomVoice serves preset "
         "voices (send voice as a speaker string)"
     ),
-    (VOICE_DESIGN, "preset"): "VoiceDesign models are not served by this build yet (text-described voices — #46)",
-    (VOICE_DESIGN, "clone"): "VoiceDesign models are not served by this build yet (text-described voices — #46)",
-    (VOICE_DESIGN, "clone_stream"): "VoiceDesign models are not served by this build yet (text-described voices — #46)",
+    (VOICE_DESIGN, "preset"): (
+        "VoiceDesign checkpoints have no preset voices — the voice comes from "
+        "`instructions` (a text description); preset `voice` is not accepted "
+        "(buffered #51; streaming #52)"
+    ),
+    (VOICE_DESIGN, "clone"): (
+        "voice cloning needs a Base checkpoint; VoiceDesign takes a text "
+        "description in `instructions` (#46)"
+    ),
+    (VOICE_DESIGN, "clone_stream"): (
+        "voice cloning needs a Base checkpoint; VoiceDesign takes a text "
+        "description in `instructions` (#46)"
+    ),
 }
 
 
