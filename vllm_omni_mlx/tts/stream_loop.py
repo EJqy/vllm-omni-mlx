@@ -4,7 +4,7 @@ Vendors mlx-audio's CustomVoice decode loop (MIT) — the escape hatch the
 M1.0 spike sanctioned for exactly this case: mlx-audio exposes a single
 fixed ``streaming_interval``, so first audio always waits for a full chunk
 (25 frames / 2 s at the old default; 6 frames / 0.5 s now). The loops are
-step-for-step mlx-audio's (0.5.7) — ``generate_custom_voice_frames`` mirrors
+step-for-step mlx-audio's (0.5.7) — ``generate_frames`` mirrors
 ``_generate_with_instruct`` (qwen3_tts.py:2516) and ``generate_icl_frames``
 mirrors ``_generate_icl`` (qwen3_tts.py:2204; the two share their AR
 skeleton) — same sampler call, same caches, same single ``mx.eval`` sync per
@@ -49,7 +49,7 @@ from .compiled_steps import (
 from .config import TTSConfig
 from .prompt_embeds import PromptEmbeds
 from .talker import Talker
-from .variants import ensure_served
+from .variants import VOICE_DESIGN, ensure_served, model_variant, require_served
 
 FRAME_RATE = 12.5  # codec frames per second of audio (12 Hz tokenizer)
 SAMPLES_PER_FRAME = 1920  # 24000 Hz / 12.5
@@ -100,11 +100,11 @@ def _flush_pending(
     return True
 
 
-def generate_custom_voice_frames(
+def generate_frames(
     model: Any,
     *,
     text: str,
-    speaker: str,
+    speaker: str | None,
     language: str = "auto",
     instruct: str | None = None,
     temperature: float = 0.9,
@@ -115,9 +115,12 @@ def generate_custom_voice_frames(
     initial_frames: int = 2,
     chunk_frames: int = 6,
 ) -> Iterator[mx.array]:
-    """Yield audio chunks ([samples] float, 24 kHz mono) for CustomVoice
-    synthesis, decoding the first ``initial_frames`` frames as soon as they
-    exist and every ``chunk_frames`` frames thereafter."""
+    """Yield audio chunks ([samples] float, 24 kHz mono) — CustomVoice with
+    a preset ``speaker``, or VoiceDesign speakerless with the voice
+    description in ``instruct`` (#52: same layout minus the spk row; the AR
+    loop, chunk scheduling and compiled closures are shared) — decoding the
+    first ``initial_frames`` frames as soon as they exist and every
+    ``chunk_frames`` frames thereafter."""
     talker = Talker(model.talker)
     predictor = CodePredictor(model.talker)
     layout = PromptEmbeds(model).build(text, speaker, language, instruct)
@@ -297,16 +300,25 @@ def generate_custom_voice_frames(
 
 def synthesize_stream(model: Any, config: TTSConfig, text: str, **overrides) -> Iterator[mx.array]:
     """Config-driven wrapper mirroring generate.synthesize's contract, on the
-    fast-path loop. `seed` reseeds MLX's RNG for reproducibility; overrides
-    follow TTSConfig.with_overrides semantics."""
-    ensure_served(model)
+    fast-path loop, routing by checkpoint type (#52): CustomVoice passes the
+    preset speaker, VoiceDesign passes ``speaker=None`` with the voice
+    description in ``instruct`` (required there). `seed` reseeds MLX's RNG
+    for reproducibility; overrides follow TTSConfig.with_overrides semantics."""
+    variant = model_variant(model)
+    require_served(variant, path="design" if variant == VOICE_DESIGN else "preset")
     cfg = config.with_overrides(**overrides)
+    if variant == VOICE_DESIGN and not (cfg.instruct or "").strip():
+        raise ValueError(
+            "VoiceDesign synthesis needs `instruct` — a voice description "
+            "like 'A cheerful young female voice with high pitch and "
+            "energetic tone' (#46)"
+        )
     if overrides.get("seed") is not None:
         mx.random.seed(int(overrides["seed"]))
-    yield from generate_custom_voice_frames(
+    yield from generate_frames(
         model,
         text=text,
-        speaker=cfg.speaker,
+        speaker=cfg.speaker if variant != VOICE_DESIGN else None,
         language=cfg.language,
         instruct=cfg.instruct,
         temperature=cfg.temperature,
@@ -335,7 +347,7 @@ def generate_icl_frames(
     chunk_frames: int = 6,
 ) -> Iterator[mx.array]:
     """Yield audio chunks for Base ICL voice cloning (#50) — the same
-    fast-path loop as :func:`generate_custom_voice_frames`, vendoring
+    fast-path loop as :func:`generate_frames`, vendoring
     mlx-audio's ``_generate_icl`` (qwen3_tts.py:2204): identical AR body
     (their two loops share the skeleton), ICL prefill instead of the preset
     prompt, and the repetition penalty floored to 1.5 — mlx-audio's guard
