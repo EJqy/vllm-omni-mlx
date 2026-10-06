@@ -57,6 +57,13 @@ vllm-omni-mlx is flexible and easy to use with:
 | **ASR** — speech → text | Whisper, Qwen3-ASR, Voxtral, … | 🚧 planned — `/v1/audio/transcriptions` (#68) |
 | **Diffusion** — text/image → image | — | 🚧 planned — roadmap (#2) |
 
+| Modality | Examples | Status |
+| --- | --- | --- |
+| **TTS** — text → speech | Qwen3-TTS (CustomVoice · Base · VoiceDesign, 0.6B/1.7B); VoxCPM2 (zero-shot · cloned · described voice, 30+ languages, 48 kHz) | ✅ verified end-to-end, buffered + streaming — [speech guide](docs/speech.md) |
+| **Omni** — any-to-any chat | Qwen3-Omni 30B-A3B | 🚧 chat works via mlx-vlm; speech-out chat in progress |
+| **ASR** — speech → text | Whisper, Qwen3-ASR, Voxtral, … | 🚧 planned — `/v1/audio/transcriptions` (#68) |
+| **Diffusion** — text/image → image | — | 🚧 planned — roadmap (#2) |
+
 Text-only LLMs and image-in/text-out VLMs load through their engines but are
 not this server's target categories.
 
