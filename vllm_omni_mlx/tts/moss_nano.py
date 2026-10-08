@@ -10,20 +10,31 @@ resampled to the codec rate before being passed to mlx-audio.
 from __future__ import annotations
 
 import base64
+import numpy as np
 import binascii
 import io
 import sys
 import threading
 import wave
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Iterator
 
 import mlx.core as mx
 
+from .generate import wav_bytes as _wav_bytes
+
 DEFAULT_MODEL = "mlx-community/MOSS-TTS-Nano-100M"
 DEFAULT_CODEC_MODEL = "mlx-community/MOSS-Audio-Tokenizer-Nano"
 SAMPLE_RATE = 48000
+
+#: HF ``config.json`` → ``architecture`` value identifying the family
+ARCH = "moss_tts_nano"
+
+#: mlx-audio module prefix of the loaded model class
+_MODULE_PREFIX = "mlx_audio.tts.models.moss_tts_nano"
+
 MAX_REF_SECONDS = 30.0
+MIN_REF_SECONDS = 0.5
 
 # PCM16 wire format is little-endian; mx.array exposes native-endian buffers.
 if sys.byteorder != "little":
@@ -32,7 +43,10 @@ if sys.byteorder != "little":
 
 @dataclass(frozen=True)
 class MossNanoConfig:
-    """Nano defaults match mlx-audio 0.5.7, including both samplers."""
+    """Nano defaults match mlx-audio 0.5.7, including both samplers.
+    streaming_* fields are our own; mlx-audio 0.5.7 does not support Nano streaming.
+    MOSS-TTS-Nano codec: 12.5 frames/s (1 frame = 80 ms).
+    max 375 frames ≈ 30 s of audio."""
 
     model_ref: str = DEFAULT_MODEL
     codec_model_ref: str | None = None
@@ -46,6 +60,7 @@ class MossNanoConfig:
     audio_top_p: float = 0.95
     audio_top_k: int = 25
     audio_repetition_penalty: float = 1.2
+
     streaming_interval: float = 0.5
     streaming_initial_interval: float = 0.08
 
@@ -71,12 +86,7 @@ def _validate_model(model: Any) -> None:
 
 
 def load_moss_nano_model(config: MossNanoConfig) -> Any:
-    """Load the language model, tokenizer and MLX codec before serving.
-
-    ``codec_model_ref`` may name a local MLX codec snapshot for offline
-    deployment. Otherwise use the MLX-converted codec: the language-model
-    config currently points to the original OpenMOSS weights.
-    """
+    """Load the language model, tokenizer and MLX codec before serving. Requires the [tts] extra."""
     try:
         from mlx_audio.tts.utils import load_model
     except ImportError as exc:
@@ -85,53 +95,54 @@ def load_moss_nano_model(config: MossNanoConfig) -> Any:
         ) from exc
     model = load_model(config.model_ref)
     _validate_model(model)
-    model._ensure_audio_tokenizer(source=config.codec_model_ref or DEFAULT_CODEC_MODEL)
+
+    # Preload the codec
+    model._ensure_audio_tokenizer(source=config.codec_model_ref)
     return model
 
 
 def decode_ref_audio(data: str, sample_rate: int = SAMPLE_RATE) -> mx.array:
     """Decode base64 audio at the codec rate, preserving mono/stereo layout.
 
-    This is deliberately independent from Qwen's 24 kHz reference helper.
-    Duration counts frames, not interleaved channel values.
+    Independent of Qwen's 24 kHz reference helper. Duration counts frames,
+    not interleaved channel values.
     """
+    # Outside the try: a missing [tts] extra is a server config error, not a bad request.
+    from mlx_audio.audio_io import read as audio_read
+
     if not isinstance(data, str) or not data:
         raise ValueError("voice.ref_audio must be non-empty base64-encoded audio")
     try:
         payload = base64.b64decode(data, validate=True)
-    except (binascii.Error, ValueError) as exc:
-        raise ValueError(f"ref_audio must be base64-encoded audio: {exc}") from None
-    try:
-        from mlx_audio.audio_io import read as audio_read
-
-        raw, actual_rate = audio_read(
+        raw, rate = audio_read(
             io.BytesIO(payload), dtype="float32", sample_rate=sample_rate
         )
         samples = mx.array(raw, dtype=mx.float32)
     except Exception as exc:
-        raise ValueError(f"ref_audio could not be decoded as audio: {exc}") from None
-    if actual_rate != sample_rate:
         raise ValueError(
-            f"ref_audio decoder returned {actual_rate} Hz, expected {sample_rate} Hz"
+            f"ref_audio could not be decoded as base64 audio: {exc}"
+        ) from None
+
+    if rate != sample_rate:
+        raise ValueError(
+            f"ref_audio decoder returned {rate} Hz, expected {sample_rate} Hz"
         )
     if samples.ndim not in (1, 2) or (
         samples.ndim == 2 and samples.shape[1] not in (1, 2)
     ):
         raise ValueError("ref_audio must contain mono or stereo audio")
-    if samples.size == 0:
-        raise ValueError("ref_audio decoded to zero samples")
     if not _all_finite(samples):
         raise ValueError("ref_audio contains non-finite samples")
     duration = samples.shape[0] / sample_rate
-    if duration > MAX_REF_SECONDS:
+    if not MIN_REF_SECONDS <= duration <= MAX_REF_SECONDS:
         raise ValueError(
-            f"ref_audio is {duration:.1f}s; the cap is {MAX_REF_SECONDS:.0f}s"
+            f"ref_audio is {duration:.2f}s; must be {MIN_REF_SECONDS:g}-{MAX_REF_SECONDS:g}s"
         )
     return samples
 
 
 def _pcm16(audio: Any) -> bytes:
-    """Sample-major float audio → explicitly downmixed little-endian PCM16."""
+    """Sample-major float audio in [-1, 1] → mono little-endian PCM16 (stereo is averaged)."""
     samples = (
         audio.astype(mx.float32)
         if isinstance(audio, mx.array)
@@ -145,9 +156,8 @@ def _pcm16(audio: Any) -> bytes:
         )
     if not _all_finite(samples):
         raise RuntimeError("MOSS Nano returned non-finite audio samples")
-    pcm = (mx.clip(samples, -1.0, 1.0) * 32767.0).astype(mx.int16)
-    mx.eval(pcm)
-    return bytes(memoryview(pcm))
+    pcm = mx.round(mx.clip(samples, -1.0, 1.0) * 32767.0).astype(mx.int16)
+    return np.asarray(pcm).astype("<i2", copy=False).tobytes()
 
 
 class MossNanoService:
@@ -168,6 +178,7 @@ class MossNanoService:
         return self.config.model_ref
 
     @property
+    # clone-only so far
     def voices(self) -> list[str]:
         return []
 
