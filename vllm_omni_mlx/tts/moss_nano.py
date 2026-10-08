@@ -297,7 +297,9 @@ class MossNanoService:
         streaming_interval: float | None = None,
         streaming_initial_interval: float | None = None,
     ) -> Iterator[bytes]:
-        self._clone_inputs(input, voice, speed, instructions, language)
+        """Simulated Stream: the first chunk lands when synthesis completes"""
+
+        ref_audio = self._clone_inputs(input, voice, speed, instructions, language)
         interval = (
             self.config.streaming_interval
             if streaming_interval is None
@@ -314,7 +316,20 @@ class MossNanoService:
         ):
             if not 0.0 < value <= 10.0:
                 raise ValueError(f"{name} must be in (0, 10] seconds")
-        raise ValueError("MOSS Nano streaming is not available yet; tracked in #73")
+
+        # mono PCM16: 2 bytes per sample, so the step stays sample-aligned
+        step = max(1, int(interval * self.sample_rate)) * 2
+
+        def stream() -> Iterator[bytes]:
+            with self._lock:
+                pcm = b"".join(self._buffered_chunks(input, ref_audio))
+            # lock released here: slicing to a slow client never blocks the next request
+            if not pcm:
+                raise RuntimeError("MOSS Nano generated no audio")
+            for start in range(0, len(pcm), step):
+                yield pcm[start : start + step]
+
+        return stream()
 
     def close(self) -> None:
         """Release this service's model reference once active generation ends."""
