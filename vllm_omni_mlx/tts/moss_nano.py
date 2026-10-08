@@ -330,8 +330,3 @@ class MossNanoService:
                 yield pcm[start : start + step]
 
         return stream()
-
-    def close(self) -> None:
-        """Release this service's model reference once active generation ends."""
-        with self._lock:
-            self._model = None
