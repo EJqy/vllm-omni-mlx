@@ -11,17 +11,14 @@ from __future__ import annotations
 
 import base64
 import numpy as np
-import binascii
 import io
 import sys
 import threading
 import wave
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, Iterator
 
 import mlx.core as mx
-
-from .generate import wav_bytes as _wav_bytes
 
 DEFAULT_MODEL = "mlx-community/MOSS-TTS-Nano-100M"
 DEFAULT_CODEC_MODEL = "mlx-community/MOSS-Audio-Tokenizer-Nano"
