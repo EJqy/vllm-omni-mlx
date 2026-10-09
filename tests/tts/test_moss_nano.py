@@ -21,7 +21,7 @@ from vllm_omni_mlx.tts.moss_nano import (
 HAS_MLX_AUDIO = importlib.util.find_spec("mlx_audio") is not None
 
 
-def reference_wav(sample_rate=48000, channels=1, seconds=0.1):
+def reference_wav(sample_rate=48000, channels=1, seconds=0.5):
     """A real small PCM clip so resampling and channel handling are exercised."""
     # Build the wire-format fixture independently of the MLX conversion under test.
     samples = struct.pack("<h", 8192) * (int(sample_rate * seconds) * channels)
@@ -60,7 +60,7 @@ class FakeModel:
 class NanoReferenceTest(unittest.TestCase):
     def test_resamples_24k_reference_to_48k_without_losing_stereo(self):
         reference = decode_ref_audio(reference_wav(sample_rate=24000, channels=2))
-        self.assertEqual(reference.shape, (4800, 2))
+        self.assertEqual(reference.shape, (24000, 2))
         self.assertIsInstance(reference, mx.array)
         self.assertEqual(reference.dtype, mx.float32)
         self.assertTrue(
@@ -69,7 +69,7 @@ class NanoReferenceTest(unittest.TestCase):
 
     def test_mono_remains_mono(self):
         reference = decode_ref_audio(reference_wav(channels=1))
-        self.assertEqual(reference.shape, (4800,))
+        self.assertEqual(reference.shape, (24000,))
 
     def test_invalid_reference_payloads(self):
         for data in (
@@ -86,14 +86,32 @@ class NanoReferenceTest(unittest.TestCase):
                 decode_ref_audio(data)
 
     def test_duration_uses_frames_not_channel_count(self):
-        stereo = mx.zeros((30 * 48000, 2), dtype=mx.float32)
-        with mock.patch("mlx_audio.audio_io.read", return_value=(stereo, 48000)):
-            self.assertEqual(decode_ref_audio("YQ==").shape, stereo.shape)
-        with mock.patch(
-            "mlx_audio.audio_io.read", return_value=(mx.zeros(30 * 48000 + 1), 48000)
-        ):
-            with self.assertRaisesRegex(ValueError, "cap is 30s"):
-                decode_ref_audio("YQ==")
+        # Both limits are inclusive, including when each frame has two channels.
+        for frames in (24000, 30 * 48000):
+            for channels in (1, 2):
+                shape = (frames,) if channels == 1 else (frames, channels)
+                samples = mx.zeros(shape, dtype=mx.float32)
+                with (
+                    self.subTest(frames=frames, channels=channels),
+                    mock.patch(
+                        "mlx_audio.audio_io.read", return_value=(samples, 48000)
+                    ),
+                ):
+                    self.assertEqual(decode_ref_audio("YQ==").shape, shape)
+
+    def test_duration_rejects_one_frame_outside_either_bound(self):
+        for frames in (24000 - 1, 30 * 48000 + 1):
+            for channels in (1, 2):
+                shape = (frames,) if channels == 1 else (frames, channels)
+                samples = mx.zeros(shape, dtype=mx.float32)
+                with (
+                    self.subTest(frames=frames, channels=channels),
+                    mock.patch(
+                        "mlx_audio.audio_io.read", return_value=(samples, 48000)
+                    ),
+                    self.assertRaisesRegex(ValueError, r"must be 0\.5-30s"),
+                ):
+                    decode_ref_audio("YQ==")
 
     def test_bad_decoded_audio_is_a_request_error(self):
         for samples, rate in (
@@ -114,7 +132,8 @@ class NanoReferenceTest(unittest.TestCase):
 
 class NanoPCMTest(unittest.TestCase):
     def test_pcm16_wire_format_for_mlx_arrays(self):
-        expected = struct.pack("<6h", -32767, -16383, 0, 16383, 32767, 32767)
+        # Conversion rounds before casting: +/-0.5 maps to +/-16384.
+        expected = struct.pack("<6h", -32767, -16384, 0, 16384, 32767, 32767)
         for dtype in (mx.float32, mx.float16, mx.bfloat16):
             with self.subTest(dtype=dtype):
                 audio = mx.array([-1.0, -0.5, 0.0, 0.5, 1.0, 2.0], dtype=dtype)
@@ -124,7 +143,7 @@ class NanoPCMTest(unittest.TestCase):
         audio = mx.array(
             [-0.75, 9.0, -0.5, 9.0, -0.25, 9.0, 0.0, 9.0, 0.25, 9.0, 0.5, 9.0]
         )[::2]
-        expected = struct.pack("<6h", -24575, -16383, -8191, 0, 8191, 16383)
+        expected = struct.pack("<6h", -24575, -16384, -8192, 0, 8192, 16384)
         self.assertEqual(moss_nano._pcm16(audio), expected)
 
     def test_pcm16_rejects_nonfinite_samples(self):
@@ -142,9 +161,9 @@ class NanoServiceTest(unittest.TestCase):
         self.service = MossNanoService(self.model)
         self.voice = {"ref_audio": reference_wav()}
         references = {
-            self.voice["ref_audio"]: mx.zeros(4800, dtype=mx.float32),
+            self.voice["ref_audio"]: mx.zeros(24000, dtype=mx.float32),
             reference_wav(sample_rate=24000, channels=2): mx.zeros(
-                (4800, 2), dtype=mx.float32
+                (24000, 2), dtype=mx.float32
             ),
         }
 
@@ -170,7 +189,7 @@ class NanoServiceTest(unittest.TestCase):
             "hello", voice=self.voice, response_format="pcm"
         )
         self.assertEqual(media_type, "audio/pcm")
-        self.assertEqual(struct.unpack("<3h", pcm), (0, 16383, -32767))
+        self.assertEqual(struct.unpack("<3h", pcm), (0, 16384, -32767))
         payload, media_type = self.service.speech_bytes("hello", voice=self.voice)
         self.assertEqual(media_type, "audio/wav")
         with wave.open(io.BytesIO(payload)) as wav:
@@ -198,7 +217,7 @@ class NanoServiceTest(unittest.TestCase):
         service.speech_bytes("hello", voice=voice)
         kwargs = self.model.kwargs
         self.assertIsInstance(kwargs["ref_audio"], mx.array)
-        self.assertEqual(kwargs["ref_audio"].shape, (4800, 2))
+        self.assertEqual(kwargs["ref_audio"].shape, (24000, 2))
         self.assertEqual(kwargs["ref_audio_sample_rate"], 48000)
         self.assertEqual(kwargs["mode"], "voice_clone")
         self.assertFalse(kwargs["stream"])
@@ -258,9 +277,38 @@ class NanoServiceTest(unittest.TestCase):
                         "hello", voice=self.voice, **{field: value}
                     )
 
-    def test_streaming_is_explicitly_unsupported(self):
-        with self.assertRaisesRegex(ValueError, "streaming is not available yet"):
-            self.service.speech_stream("hello", voice=self.voice)
+    def test_streaming_yields_finished_pcm_in_sample_aligned_chunks(self):
+        stream = self.service.speech_stream(
+            "hello", voice=self.voice, streaming_interval=2 / 48000
+        )
+        self.addCleanup(stream.close)
+        self.assertIsNone(self.model.kwargs)
+        first = next(stream)
+        self.assertEqual(first, struct.pack("<2h", 0, 16384))
+        self.assertTrue(self.model.finished)
+        self.assertFalse(self.model.kwargs["stream"])
+        remaining = list(stream)
+        self.assertEqual(remaining, [struct.pack("<h", -32767)])
+        pcm, _ = self.service.speech_bytes(
+            "hello", voice=self.voice, response_format="pcm"
+        )
+        self.assertEqual(first + b"".join(remaining), pcm)
+
+    def test_partial_stream_close_leaves_service_usable(self):
+        stream = self.service.speech_stream(
+            "hello", voice=self.voice, streaming_interval=2 / 48000
+        )
+        self.addCleanup(stream.close)
+        next(stream)
+        # A paused client must not hold the generation lock.
+        self.assertTrue(self.service._lock.acquire(blocking=False))
+        self.service._lock.release()
+        stream.close()
+        pcm, _ = self.service.speech_bytes(
+            "hello again", voice=self.voice, response_format="pcm"
+        )
+        self.assertEqual(pcm, struct.pack("<3h", 0, 16384, -32767))
+        self.assertEqual(self.model.kwargs["text"], "hello again")
 
     def test_generation_failure_releases_lock(self):
         self.model.audio = mx.zeros((1, 2, 3))
@@ -283,13 +331,6 @@ class NanoServiceTest(unittest.TestCase):
                     self.assertRaisesRegex(ValueError, name),
                 ):
                     MossNanoConfig(**{name: value})
-
-    def test_close_releases_model_and_prevents_further_generation(self):
-        self.service.close()
-        self.service.close()
-        self.assertIsNone(self.service._model)
-        with self.assertRaisesRegex(RuntimeError, "closed"):
-            self.service.speech_bytes("hello", voice=self.voice)
 
 
 class NanoLoaderTest(unittest.TestCase):
