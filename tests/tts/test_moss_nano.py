@@ -3,7 +3,9 @@
 import base64
 import importlib.util
 import io
+import queue
 import struct
+import threading
 import unittest
 import wave
 from types import SimpleNamespace
@@ -159,6 +161,7 @@ class NanoServiceTest(unittest.TestCase):
     def setUp(self):
         self.model = FakeModel()
         self.service = MossNanoService(self.model)
+        self.addCleanup(self.service._pool.shutdown)
         self.voice = {"ref_audio": reference_wav()}
         references = {
             self.voice["ref_audio"]: mx.zeros(24000, dtype=mx.float32),
@@ -178,6 +181,11 @@ class NanoServiceTest(unittest.TestCase):
         )
         patcher.start()
         self.addCleanup(patcher.stop)
+        codec = mock.patch.object(
+            moss_nano, "validate_streaming_codec", return_value=3840
+        )
+        codec.start()
+        self.addCleanup(codec.stop)
 
     def test_cloning_metadata(self):
         self.assertEqual(self.service.voices, [])
@@ -210,6 +218,7 @@ class NanoServiceTest(unittest.TestCase):
             codec_model_ref="/cached/codec",
         )
         service = MossNanoService(self.model, config)
+        self.addCleanup(service._pool.shutdown)
         voice = {
             "ref_audio": reference_wav(sample_rate=24000, channels=2),
             "ref_text": "ignored transcript",
@@ -277,38 +286,233 @@ class NanoServiceTest(unittest.TestCase):
                         "hello", voice=self.voice, **{field: value}
                     )
 
-    def test_streaming_yields_finished_pcm_in_sample_aligned_chunks(self):
-        stream = self.service.speech_stream(
-            "hello", voice=self.voice, streaming_interval=2 / 48000
-        )
-        self.addCleanup(stream.close)
-        self.assertIsNone(self.model.kwargs)
-        first = next(stream)
-        self.assertEqual(first, struct.pack("<2h", 0, 16384))
-        self.assertTrue(self.model.finished)
-        self.assertFalse(self.model.kwargs["stream"])
-        remaining = list(stream)
-        self.assertEqual(remaining, [struct.pack("<h", -32767)])
-        pcm, _ = self.service.speech_bytes(
-            "hello", voice=self.voice, response_format="pcm"
-        )
-        self.assertEqual(first + b"".join(remaining), pcm)
+    def test_streaming_emits_pcm_before_generation_finishes(self):
+        resume = threading.Event()
+        finished = threading.Event()
+        self.addCleanup(resume.set)
 
-    def test_partial_stream_close_leaves_service_usable(self):
-        stream = self.service.speech_stream(
-            "hello", voice=self.voice, streaming_interval=2 / 48000
-        )
-        self.addCleanup(stream.close)
-        next(stream)
-        # A paused client must not hold the generation lock.
-        self.assertTrue(self.service._lock.acquire(blocking=False))
-        self.service._lock.release()
-        stream.close()
+        def chunks(*args, **kwargs):
+            try:
+                yield self.model.audio[:2]
+                self.assertTrue(resume.wait(5), "consumer never received first chunk")
+                yield self.model.audio[2:]
+            finally:
+                finished.set()
+
+        with mock.patch.object(
+            moss_nano, "synthesize_stream", side_effect=chunks
+        ) as run:
+            stream = self.service.speech_stream(
+                "hello",
+                voice=self.voice,
+                streaming_interval=0.5,
+                streaming_initial_interval=0.08,
+            )
+            self.addCleanup(stream.close)
+            run.assert_not_called()
+            first = next(stream)
+            self.assertEqual(first, struct.pack("<2h", 0, 16384))
+            self.assertFalse(finished.is_set())
+            self.assertFalse(self.service._lock.acquire(blocking=False))
+            resume.set()
+            self.assertEqual(list(stream), [struct.pack("<h", -32767)])
+            self.assertTrue(finished.is_set())
+            call = run.call_args
+            self.assertEqual(call.args[:3], (self.model, self.service.config, "hello"))
+            self.assertEqual(call.args[3].shape, (24000,))
+            self.assertEqual(call.kwargs["streaming_interval"], 0.5)
+            self.assertEqual(call.kwargs["streaming_initial_interval"], 0.08)
+
+    def test_partial_stream_close_cancels_producer_and_leaves_service_usable(self):
+        finished = threading.Event()
+
+        def chunks(*args, cancel, **kwargs):
+            try:
+                yield self.model.audio
+                self.assertTrue(
+                    cancel.wait(5), "stream close did not cancel generation"
+                )
+            finally:
+                finished.set()
+
+        with mock.patch.object(moss_nano, "synthesize_stream", side_effect=chunks):
+            stream = self.service.speech_stream("hello", voice=self.voice)
+            self.addCleanup(stream.close)
+            next(stream)
+            stream.close()
+            stream.close()
+            self.assertTrue(finished.wait(5))
+            self.assertTrue(stream._done.wait(5))
+            self.assertTrue(self.service._lock.acquire(blocking=False))
+            self.service._lock.release()
+            self.assertEqual(list(stream), [])
         pcm, _ = self.service.speech_bytes(
             "hello again", voice=self.voice, response_format="pcm"
         )
         self.assertEqual(pcm, struct.pack("<3h", 0, 16384, -32767))
-        self.assertEqual(self.model.kwargs["text"], "hello again")
+
+    def test_unstarted_stream_close_does_not_generate(self):
+        with mock.patch.object(moss_nano, "synthesize_stream") as run:
+            stream = self.service.speech_stream("hello", voice=self.voice)
+            stream.close()
+            self.assertEqual(list(stream), [])
+            run.assert_not_called()
+
+    def test_slow_consumer_has_bounded_buffer_and_can_cancel(self):
+        blocked = threading.Event()
+        finished = threading.Event()
+        produced = []
+
+        def chunks(*args, **kwargs):
+            try:
+                for index in range(100):
+                    produced.append(index)
+                    if index == 2:
+                        blocked.set()
+                    yield self.model.audio
+            finally:
+                finished.set()
+
+        with mock.patch.object(moss_nano, "synthesize_stream", side_effect=chunks):
+            stream = self.service.speech_stream("hello", voice=self.voice)
+            self.addCleanup(stream.close)
+            next(stream)
+            self.assertTrue(blocked.wait(5))
+            stream.close()
+            self.assertTrue(finished.wait(5))
+            self.assertLessEqual(len(produced), 3)  # delivered + queued + in flight
+
+    def test_streaming_failure_propagates_and_releases_lock(self):
+        def chunks(*args, **kwargs):
+            yield self.model.audio
+            raise RuntimeError("codec failed")
+
+        with mock.patch.object(moss_nano, "synthesize_stream", side_effect=chunks):
+            stream = self.service.speech_stream("hello", voice=self.voice)
+            self.addCleanup(stream.close)
+            next(stream)
+            with self.assertRaisesRegex(RuntimeError, "codec failed"):
+                next(stream)
+            self.assertTrue(self.service._lock.acquire(blocking=False))
+            self.service._lock.release()
+
+    def test_final_chunk_is_not_lost_when_completion_races_queue_timeout(self):
+        for failure in (False, True):
+            with self.subTest(failure=failure):
+                release = threading.Event()
+
+                def chunks(*args, **kwargs):
+                    self.assertTrue(release.wait(5))
+                    yield self.model.audio
+                    if failure:
+                        raise RuntimeError("after final chunk")
+
+                with mock.patch.object(
+                    moss_nano, "synthesize_stream", side_effect=chunks
+                ):
+                    stream = self.service.speech_stream("hello", voice=self.voice)
+                    self.addCleanup(stream.close)
+                    original_get = stream._queue.get
+                    first = True
+
+                    def timed_out_get(*args, **kwargs):
+                        nonlocal first
+                        if first:
+                            first = False
+                            # Timeout occurs, then the producer writes and
+                            # finishes before the consumer checks completion.
+                            release.set()
+                            self.assertTrue(stream._done.wait(5))
+                            raise queue.Empty
+                        return original_get(*args, **kwargs)
+
+                    with mock.patch.object(
+                        stream._queue, "get", side_effect=timed_out_get
+                    ):
+                        self.assertEqual(
+                            next(stream), struct.pack("<3h", 0, 16384, -32767)
+                        )
+                        if failure:
+                            with self.assertRaisesRegex(
+                                RuntimeError, "after final chunk"
+                            ):
+                                next(stream)
+                        else:
+                            with self.assertRaises(StopIteration):
+                                next(stream)
+
+    def test_empty_stream_is_a_model_failure(self):
+        with mock.patch.object(
+            moss_nano, "synthesize_stream", return_value=(x for x in ())
+        ):
+            with self.assertRaisesRegex(RuntimeError, "generated no audio"):
+                list(self.service.speech_stream("hello", voice=self.voice))
+
+    def test_streaming_codec_errors_are_eager(self):
+        with mock.patch.object(
+            moss_nano,
+            "validate_streaming_codec",
+            side_effect=RuntimeError("codec unavailable"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "codec unavailable"):
+                self.service.speech_stream("hello", voice=self.voice)
+
+    def test_buffered_and_streamed_generation_use_the_same_worker(self):
+        threads = []
+        original_generate = self.model.generate
+
+        def buffered(**kwargs):
+            threads.append(threading.get_ident())
+            yield from original_generate(**kwargs)
+
+        def streamed(*args, **kwargs):
+            threads.append(threading.get_ident())
+            yield self.model.audio
+
+        with (
+            mock.patch.object(self.model, "generate", side_effect=buffered),
+            mock.patch.object(moss_nano, "synthesize_stream", side_effect=streamed),
+        ):
+            self.service.speech_bytes("one", voice=self.voice)
+            list(self.service.speech_stream("two", voice=self.voice))
+            self.service.speech_bytes("three", voice=self.voice)
+        self.assertEqual(len(threads), 3)
+        self.assertEqual(len(set(threads)), 1)
+        self.assertNotEqual(threads[0], threading.get_ident())
+
+    def test_seed_is_applied_on_worker_for_every_request(self):
+        service = MossNanoService(self.model, MossNanoConfig(seed=17))
+        self.addCleanup(service._pool.shutdown)
+        random_audio = []
+
+        def buffered(**kwargs):
+            audio = mx.random.uniform(low=-1, high=1, shape=(16,))
+            random_audio.append(audio.tolist())
+            yield SimpleNamespace(audio=audio, sample_rate=48000)
+
+        def streamed(*args, **kwargs):
+            audio = mx.random.uniform(low=-1, high=1, shape=(16,))
+            random_audio.append(audio.tolist())
+            yield audio
+
+        with (
+            mock.patch.object(self.model, "generate", side_effect=buffered),
+            mock.patch.object(moss_nano, "synthesize_stream", side_effect=streamed),
+        ):
+            first, _ = service.speech_bytes(
+                "one", voice=self.voice, response_format="pcm"
+            )
+            # Resetting the caller's thread must not change worker reproducibility.
+            mx.random.seed(999)
+            second = b"".join(service.speech_stream("two", voice=self.voice))
+            third, _ = service.speech_bytes(
+                "three", voice=self.voice, response_format="pcm"
+            )
+        self.assertEqual(len(random_audio), 3)
+        self.assertEqual(random_audio[0], random_audio[1])
+        self.assertEqual(random_audio[1], random_audio[2])
+        self.assertEqual(first, second)
+        self.assertEqual(second, third)
 
     def test_generation_failure_releases_lock(self):
         self.model.audio = mx.zeros((1, 2, 3))

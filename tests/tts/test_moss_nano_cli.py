@@ -23,6 +23,7 @@ class FakeNanoConfig:
     model_ref: str = MODEL
     max_new_frames: int = 375
     audio_temperature: float = 0.8
+    seed: int | None = None
 
 
 def wav_payload(sample_rate=48000, frames=12000):
@@ -143,13 +144,18 @@ class MossNanoCliTest(unittest.TestCase):
 
     def test_synthesis_maps_options_and_preserves_service_wav(self):
         self.assertEqual(
-            self.synthesize("--max-tokens", "42", "--temperature", "0.3", "--seed", "7"),
+            self.synthesize(
+                "--max-tokens", "42", "--temperature", "0.3", "--seed", "7"
+            ),
             0,
         )
         self.load_model.assert_called_once_with(
-            FakeNanoConfig(model_ref=MODEL, max_new_frames=42, audio_temperature=0.3)
+            FakeNanoConfig(
+                model_ref=MODEL, max_new_frames=42, audio_temperature=0.3, seed=7
+            )
         )
-        self.seed.assert_called_once_with(7)
+        # Nano's worker owns its RNG; the CLI passes the seed through config.
+        self.seed.assert_not_called()
         call = self.service.speech_bytes.call_args
         self.assertEqual(call.args, ("hello",))
         self.assertEqual(
@@ -202,7 +208,9 @@ class MossNanoCliTest(unittest.TestCase):
         self.assertFalse(self.output.exists())
 
     def test_generation_error_is_reported_without_creating_output(self):
-        self.service.speech_bytes.side_effect = RuntimeError("MOSS Nano generated no audio")
+        self.service.speech_bytes.side_effect = RuntimeError(
+            "MOSS Nano generated no audio"
+        )
         self.assertEqual(self.synthesize(), 1)
         self.assertIn("generated no audio", self.stderr.getvalue())
         self.assertFalse(self.output.exists())

@@ -336,14 +336,12 @@ def _tts_synthesize_moss_nano(args) -> int:
             if not math.isfinite(args.temperature) or args.temperature <= 0:
                 raise ValueError("--temperature must be finite and positive for MOSS Nano")
             overrides["audio_temperature"] = args.temperature
+        if args.seed is not None:
+            overrides["seed"] = args.seed
         config = MossNanoConfig(model_ref=args.model, **overrides)
         with open(args.ref_audio, "rb") as f:
             voice = {"ref_audio": base64.b64encode(f.read()).decode("ascii")}
         service = MossNanoService(load_moss_nano_model(config), config)
-        if args.seed is not None:
-            import mlx.core as mx
-
-            mx.random.seed(args.seed)
         start = time.perf_counter()
         data, _ = service.speech_bytes(args.text, voice=voice, response_format="wav")
         elapsed = time.perf_counter() - start

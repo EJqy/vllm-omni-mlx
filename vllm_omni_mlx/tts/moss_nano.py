@@ -10,15 +10,20 @@ resampled to the codec rate before being passed to mlx-audio.
 from __future__ import annotations
 
 import base64
-import numpy as np
+import concurrent.futures
+import contextlib
 import io
+import queue
 import sys
 import threading
 import wave
 from dataclasses import dataclass
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 import mlx.core as mx
+import numpy as np
+
+from .moss_nano_loop import synthesize_stream, validate_streaming_codec
 
 DEFAULT_MODEL = "mlx-community/MOSS-TTS-Nano-100M"
 DEFAULT_CODEC_MODEL = "mlx-community/MOSS-Audio-Tokenizer-Nano"
@@ -41,9 +46,11 @@ if sys.byteorder != "little":
 @dataclass(frozen=True)
 class MossNanoConfig:
     """Nano defaults match mlx-audio 0.5.7, including both samplers.
-    streaming_* fields are our own; mlx-audio 0.5.7 does not support Nano streaming.
-    MOSS-TTS-Nano codec: 12.5 frames/s (1 frame = 80 ms).
-    max 375 frames ≈ 30 s of audio."""
+
+    Streaming intervals measure audio duration and are rounded down to whole
+    codec frames (at least one); geometry comes from the loaded codec. The
+    generation budget applies per text segment, as in the library generator.
+    """
 
     model_ref: str = DEFAULT_MODEL
     codec_model_ref: str | None = None
@@ -57,6 +64,7 @@ class MossNanoConfig:
     audio_top_p: float = 0.95
     audio_top_k: int = 25
     audio_repetition_penalty: float = 1.2
+    seed: int | None = None
 
     streaming_interval: float = 0.5
     streaming_initial_interval: float = 0.08
@@ -157,6 +165,87 @@ def _pcm16(audio: Any) -> bytes:
     return np.asarray(pcm).astype("<i2", copy=False).tobytes()
 
 
+class _PCMStream(Iterator[bytes]):
+    """Lazy, bounded delivery from the service's single generation worker.
+
+    Only the worker touches MLX or closes the synthesis generator. Consumers
+    may cancel concurrently with ``next``; cancellation also unblocks a
+    producer waiting for a slow client to drain the one-chunk queue.
+    """
+
+    def __init__(
+        self,
+        pool: concurrent.futures.ThreadPoolExecutor,
+        generate: Callable[[threading.Event], Iterator[bytes]],
+    ):
+        self._pool = pool
+        self._generate = generate
+        self._queue: queue.Queue[bytes] = queue.Queue(maxsize=1)
+        self._cancel = threading.Event()
+        self._done = threading.Event()
+        self._state_lock = threading.Lock()
+        self._future: concurrent.futures.Future | None = None
+        self._error: Exception | None = None
+
+    def _produce(self) -> None:
+        try:
+            with contextlib.closing(self._generate(self._cancel)) as chunks:
+                for chunk in chunks:
+                    while not self._cancel.is_set():
+                        try:
+                            self._queue.put(chunk, timeout=0.05)
+                            break
+                        except queue.Full:
+                            continue
+                    if self._cancel.is_set():
+                        break
+        except Exception as exc:
+            self._error = exc
+        finally:
+            self._done.set()
+
+    def __next__(self) -> bytes:
+        with self._state_lock:
+            if self._cancel.is_set():
+                raise StopIteration
+            if self._future is None:
+                self._future = self._pool.submit(self._produce)
+        while not self._cancel.is_set():
+            try:
+                chunk = self._queue.get(timeout=0.05)
+                if self._cancel.is_set():
+                    raise StopIteration
+                return chunk
+            except queue.Empty:
+                if self._done.is_set():
+                    # A final put can race with get() timing out. Once done is
+                    # set there are no more writes, so drain before end/error.
+                    try:
+                        chunk = self._queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                    else:
+                        if self._cancel.is_set():
+                            raise StopIteration
+                        return chunk
+                    error, self._error = self._error, None
+                    self.close()
+                    if error is not None:
+                        raise error
+                    raise StopIteration
+        raise StopIteration
+
+    def close(self) -> None:
+        with self._state_lock:
+            self._cancel.set()
+            if self._future is None or self._future.cancel():
+                self._done.set()
+
+    def cancel(self) -> None:
+        """Nonblocking cancellation hook for the HTTP audio adapter."""
+        self.close()
+
+
 class MossNanoService:
     """Batch-1, cloning-only speech service; request validation is eager."""
 
@@ -169,6 +258,9 @@ class MossNanoService:
         self._model = model
         self.config = config or MossNanoConfig()
         self._lock = threading.Lock()
+        self._pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="moss-nano-gen"
+        )
 
     @property
     def name(self) -> str:
@@ -270,8 +362,14 @@ class MossNanoService:
         if response_format not in ("wav", "pcm"):
             raise ValueError("response_format must be 'wav' or 'pcm'")
         ref_audio = self._clone_inputs(input, voice, speed, instructions, language)
-        with self._lock:
-            pcm = b"".join(self._buffered_chunks(input, ref_audio))
+
+        def generate() -> bytes:
+            with self._lock:
+                if self.config.seed is not None:
+                    mx.random.seed(self.config.seed)
+                return b"".join(self._buffered_chunks(input, ref_audio))
+
+        pcm = self._pool.submit(generate).result()
         if not pcm:
             raise RuntimeError("MOSS Nano generated no audio")
         if response_format == "pcm":
@@ -294,7 +392,12 @@ class MossNanoService:
         streaming_interval: float | None = None,
         streaming_initial_interval: float | None = None,
     ) -> Iterator[bytes]:
-        """Simulated Stream: the first chunk lands when synthesis completes"""
+        """Yield PCM while Nano is generating, with independent codec state.
+
+        Validation is eager. Generation and conversion run on the same worker
+        as buffered requests, preserving batch-1 semantics. Closing the returned
+        iterator cancels work at the next frame boundary and releases the lock.
+        """
 
         ref_audio = self._clone_inputs(input, voice, speed, instructions, language)
         interval = (
@@ -314,16 +417,36 @@ class MossNanoService:
             if not 0.0 < value <= 10.0:
                 raise ValueError(f"{name} must be in (0, 10] seconds")
 
-        # mono PCM16: 2 bytes per sample, so the step stays sample-aligned
-        step = max(1, int(interval * self.sample_rate)) * 2
+        validate_streaming_codec(self._model)
 
-        def stream() -> Iterator[bytes]:
+        def generate(cancel: threading.Event) -> Iterator[bytes]:
+            if cancel.is_set():
+                return
             with self._lock:
-                pcm = b"".join(self._buffered_chunks(input, ref_audio))
-            # lock released here: slicing to a slow client never blocks the next request
-            if not pcm:
-                raise RuntimeError("MOSS Nano generated no audio")
-            for start in range(0, len(pcm), step):
-                yield pcm[start : start + step]
+                if cancel.is_set():
+                    return
+                if self.config.seed is not None:
+                    mx.random.seed(self.config.seed)
+                emitted = False
+                with contextlib.closing(
+                    synthesize_stream(
+                        self._model,
+                        self.config,
+                        input,
+                        ref_audio,
+                        streaming_interval=interval,
+                        streaming_initial_interval=initial,
+                        cancel=cancel,
+                    )
+                ) as chunks:
+                    for audio in chunks:
+                        if cancel.is_set():
+                            return
+                        if audio is not None and audio.size:
+                            pcm = _pcm16(audio)
+                            emitted = True
+                            yield pcm
+                if not emitted and not cancel.is_set():
+                    raise RuntimeError("MOSS Nano generated no audio")
 
-        return stream()
+        return _PCMStream(self._pool, generate)
