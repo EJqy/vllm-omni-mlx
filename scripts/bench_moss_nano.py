@@ -2,7 +2,7 @@
 """Compare real MOSS Nano buffered/streaming cold and warm serving latency.
 
 Each mode/text pair starts in a fresh process. "cold" is its first request
-after loading; model load time is reported separately. Warm requests reuse
+after model and codec loading; load time is reported separately. Warm requests reuse
 the model and service. Peak memory is MLX allocator memory (including weights),
 not total process RSS. Reference decoding is included in request latency.
 
@@ -26,6 +26,7 @@ import statistics
 import subprocess
 import sys
 import time
+import wave
 from importlib.metadata import version
 from itertools import pairwise
 from pathlib import Path
@@ -63,6 +64,9 @@ def _parser():
         "--json", metavar="PATH", help="write JSON; '-' prints only JSON on stdout"
     )
     parser.add_argument(
+        "--audio-dir", type=Path, help="save each generated WAV outside timed synthesis"
+    )
+    parser.add_argument(
         "--_worker-mode", choices=("buffered", "stream"), help=argparse.SUPPRESS
     )
     return parser
@@ -80,70 +84,74 @@ def _worker(args):
     voice = {"ref_audio": base64.b64encode(args.ref_audio.read_bytes()).decode("ascii")}
     config = MossNanoConfig(
         model_ref=args.model,
-        codec_model_ref=args.codec_model,
-        max_new_frames=args.max_frames,
+        max_tokens=args.max_frames,
         do_sample=not args.greedy,
-        seed=args.seed,
     )
     started = time.perf_counter()
     model = load_moss_nano_model(config)
+    model._ensure_audio_tokenizer(source=args.codec_model)
     service = MossNanoService(model, config)
     load_s = time.perf_counter() - started
     runs = []
-    try:
-        for index in range(1 + args.warm_runs):
-            mx.reset_peak_memory()
-            started = time.perf_counter()
-            chunks = []
-            chunk_times = []
-            first_s = None
-            if args._worker_mode == "buffered":
-                pcm, _ = service.speech_bytes(
-                    args.text, voice=voice, response_format="pcm"
+    for index in range(1 + args.warm_runs):
+        mx.random.seed(args.seed)
+        mx.reset_peak_memory()
+        started = time.perf_counter()
+        chunks = []
+        chunk_times = []
+        first_s = None
+        if args._worker_mode == "buffered":
+            pcm, _ = service.speech_bytes(args.text, voice=voice, response_format="pcm")
+            first_s = time.perf_counter() - started
+            chunks.append(pcm)
+            chunk_times.append(first_s)
+        else:
+            with contextlib.closing(
+                service.speech_stream(
+                    args.text,
+                    voice=voice,
+                    streaming_interval=args.interval,
+                    streaming_initial_interval=args.initial_interval,
                 )
-                first_s = time.perf_counter() - started
-                chunks.append(pcm)
-                chunk_times.append(first_s)
-            else:
-                with contextlib.closing(
-                    service.speech_stream(
-                        args.text,
-                        voice=voice,
-                        streaming_interval=args.interval,
-                        streaming_initial_interval=args.initial_interval,
-                    )
-                ) as stream:
-                    for chunk in stream:
-                        chunk_times.append(time.perf_counter() - started)
-                        if first_s is None:
-                            first_s = chunk_times[-1]
-                        chunks.append(chunk)
-            wall_s = time.perf_counter() - started
-            pcm = b"".join(chunks)
-            if not pcm or len(pcm) % 2:
-                raise RuntimeError("service returned empty or misaligned PCM16")
-            audio_s = len(pcm) / (2 * service.sample_rate)
-            gaps = [right - left for left, right in pairwise(chunk_times)]
-            runs.append(
-                {
-                    "phase": "cold" if index == 0 else "warm",
-                    "run": index,
-                    "ttfa_s": first_s,
-                    "wall_s": wall_s,
-                    "audio_s": audio_s,
-                    "rtf": wall_s / audio_s,
-                    "pcm_bytes": len(pcm),
-                    "chunks": len(chunks),
-                    "first_chunk_audio_s": len(chunks[0]) / (2 * service.sample_rate),
-                    "chunk_arrival_s": chunk_times,
-                    "chunk_gap_max_s": max(gaps) if gaps else None,
-                    "chunk_gap_median_s": statistics.median(gaps) if gaps else None,
-                    "peak_memory_bytes": mx.get_peak_memory(),
-                    "pcm_sha256": hashlib.sha256(pcm).hexdigest(),
-                }
-            )
-    finally:
-        service._pool.shutdown(wait=True, cancel_futures=True)
+            ) as stream:
+                for chunk in stream:
+                    chunk_times.append(time.perf_counter() - started)
+                    if first_s is None:
+                        first_s = chunk_times[-1]
+                    chunks.append(chunk)
+        wall_s = time.perf_counter() - started
+        pcm = b"".join(chunks)
+        if not pcm or len(pcm) % 2:
+            raise RuntimeError("service returned empty or misaligned PCM16")
+        audio_s = len(pcm) / (2 * service.sample_rate)
+        gaps = [right - left for left, right in pairwise(chunk_times)]
+        runs.append(
+            {
+                "phase": "cold" if index == 0 else "warm",
+                "run": index,
+                "ttfa_s": first_s,
+                "wall_s": wall_s,
+                "audio_s": audio_s,
+                "rtf": wall_s / audio_s,
+                "pcm_bytes": len(pcm),
+                "chunks": len(chunks),
+                "first_chunk_audio_s": len(chunks[0]) / (2 * service.sample_rate),
+                "chunk_arrival_s": chunk_times,
+                "chunk_gap_max_s": max(gaps) if gaps else None,
+                "chunk_gap_median_s": statistics.median(gaps) if gaps else None,
+                "peak_memory_bytes": mx.get_peak_memory(),
+                "pcm_sha256": hashlib.sha256(pcm).hexdigest(),
+            }
+        )
+        if args.audio_dir is not None:
+            text_id = hashlib.sha256(args.text.encode()).hexdigest()[:8]
+            audio_path = args.audio_dir / f"{text_id}-{args._worker_mode}-{index}.wav"
+            with wave.open(str(audio_path), "wb") as wav:
+                wav.setnchannels(1)
+                wav.setsampwidth(2)
+                wav.setframerate(service.sample_rate)
+                wav.writeframes(pcm)
+            runs[-1]["wav_path"] = str(audio_path.resolve())
     return {
         "mode": args._worker_mode,
         "load_s": load_s,
@@ -167,6 +175,8 @@ def main(argv=None):
     ):
         if not math.isfinite(value) or not 0 < value <= 10:
             parser.error(f"{flag} must be in (0, 10]")
+    if args.audio_dir is not None:
+        args.audio_dir.mkdir(parents=True, exist_ok=True)
     if args._worker_mode:
         # Model loaders sometimes print progress to stdout; keep the child
         # protocol machine-readable and forward those messages to stderr.
@@ -194,12 +204,12 @@ def main(argv=None):
         "codec_model": args.codec_model,
         "reference": str(args.ref_audio.resolve()),
         "seed": args.seed,
-        "seed_scope": "MossNanoConfig.seed resets the generation worker for each request",
+        "seed_scope": "mx.random.seed resets the calling thread before each request",
         "do_sample": not args.greedy,
         "max_frames_per_text_chunk": args.max_frames,
         "interval_s": args.interval,
         "initial_interval_s": args.initial_interval,
-        "cold_definition": "first request in a fresh process after model load",
+        "cold_definition": "first request in a fresh process after model and codec load",
         "memory_definition": "peak MLX allocator bytes, including resident weights",
         "cases": [],
     }
@@ -236,6 +246,8 @@ def main(argv=None):
                 "--warm-runs",
                 str(args.warm_runs),
             ]
+            if args.audio_dir is not None:
+                command.extend(["--audio-dir", str(args.audio_dir.resolve())])
             if args.greedy:
                 command.append("--greedy")
             completed = subprocess.run(
